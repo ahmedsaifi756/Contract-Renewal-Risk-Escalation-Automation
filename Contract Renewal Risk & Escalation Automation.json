@@ -1,0 +1,436 @@
+{
+  "name": "Contract Renewal Risk & Escalation Automation",
+  "nodes": [
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "models/gemini-3-flash-preview"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=You are a contract information extraction system.\n\nExtract the following fields from the provided contract text:\n\n- vendor\n- renewal_date\n- notice_period_days\n- auto_renewal\n- annual_value\n\nRules:\n\n1. Return ONLY valid JSON.\n2. Do not make business or risk decisions.\n3. Do not calculate the notice deadline.\n4. Do not calculate days remaining.\n5. renewal_date must use ISO format YYYY-MM-DD when explicitly available.\n6. notice_period_days must be a number when explicitly available.\n7. auto_renewal must be true or false when the contract clearly indicates whether it automatically renews.\n8. annual_value must be a number without currency symbols or commas.\n9. If a field cannot be reliably determined from the contract, return null.\n10. Do not invent missing information.\n\nContract:\n{{ $json.contract_text }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        -304,
+        -80
+      ],
+      "id": "9d5eee10-044e-42f0-81ea-c400657aff5c",
+      "name": "Message a model",
+      "credentials": {
+        "googlePalmApi": {
+          "id": null,
+          "name": "",
+          "__aiGatewayManaged": true
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "contract-renewal",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -736,
+        -80
+      ],
+      "id": "8daccc61-b061-4755-bd6d-c7d56a87438d",
+      "name": "Receive contract",
+      "webhookId": "0317b890-b3f3-4bda-8956-12aa9714d269"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nconst results = [];\n\nfor (const item of items) {\n  const body = item.json.body || item.json;\n\n  const contractId = body.contract_id;\n  const contractText = body.contract_text;\n\n  const errors = [];\n\n  if (!contractId || typeof contractId !== 'string' || contractId.trim() === '') {\n    errors.push('contract_id is required and must be a non-empty string');\n  }\n\n  if (!contractText || typeof contractText !== 'string') {\n    errors.push('contract_text is required and must be a string');\n  } else if (contractText.trim().length < 20) {\n    errors.push('contract_text is too short to be a usable contract');\n  } else if (contractText.length > 100000) {\n    errors.push('contract_text exceeds maximum allowed length');\n  }\n\n  if (errors.length > 0) {\n    results.push({\n      json: {\n        valid: false,\n        errors,\n        contract_id: contractId || null\n      }\n    });\n  } else {\n    results.push({\n      json: {\n        valid: true,\n        contract_id: contractId.trim(),\n        contract_text: contractText.trim()\n      }\n    });\n  }\n}\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -512,
+        -80
+      ],
+      "id": "261fea7a-aa52-4ef4-b1b8-9e1ffc6e9208",
+      "name": "Validate Contract Input"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const data = item.json;\n\n  // Gemini response ko parse karo\n  let extracted;\n  try {\n    const rawText =\n    data?.content?.parts?.[0]?.text ??                    // ← Gemini node ka actual shape\n    data?.candidates?.[0]?.content?.parts?.[0]?.text ??   // ← native API fallback\n    data?.text ??                                          // ← plain text fallback\n    null;\n\n    if (rawText === null) {\n      throw new Error('No text found in Gemini response');\n    }\n\n    // Markdown fence strip karo agar hai\n    const cleaned = String(rawText)\n      .replace(/^```json\\s*/i, '')\n      .replace(/^```\\s*/i, '')\n      .replace(/```$/i, '')\n      .trim();\n\n    extracted = JSON.parse(cleaned);\n  } catch (err) {\n    results.push({\n      json: {\n        valid: false,\n        errors: [`MALFORMED_GEMINI_OUTPUT: ${err.message}`]\n      }\n    });\n    continue;\n  }\n\n  const errors = [];\n\n  // ---------- VENDOR ----------\n  const vendor =\n    typeof extracted.vendor === 'string' && extracted.vendor.trim() !== ''\n      ? extracted.vendor.trim()\n      : null;\n\n  if (!vendor) {\n    errors.push('vendor is missing or invalid');\n  }\n\n  // ---------- RENEWAL DATE ----------\n  const renewalDateRaw =\n    typeof extracted.renewal_date === 'string'\n      ? extracted.renewal_date.trim()\n      : null;\n\n  let renewalDate = null;\n\n  if (!renewalDateRaw) {\n    errors.push('renewal_date is missing');\n  } else if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(renewalDateRaw)) {\n    errors.push('renewal_date must use YYYY-MM-DD format');\n  } else {\n    const d = new Date(`${renewalDateRaw}T00:00:00Z`);\n    if (Number.isNaN(d.getTime())) {\n      errors.push('renewal_date is not a valid calendar date');\n    } else {\n      renewalDate = renewalDateRaw;\n    }\n  }\n\n  // ---------- NOTICE PERIOD ----------\n  const noticeRaw = extracted.notice_period_days;\n\n  let noticePeriod = NaN;\n\n  if (typeof noticeRaw === 'number') {\n    noticePeriod = noticeRaw;\n  } else if (typeof noticeRaw === 'string' && noticeRaw.trim() !== '') {\n    noticePeriod = Number(noticeRaw);\n  }\n\n  if (!Number.isFinite(noticePeriod) || noticePeriod < 0 || !Number.isInteger(noticePeriod)) {\n    errors.push('notice_period_days must be a non-negative integer');\n  }\n\n  // ---------- AUTO RENEWAL ----------\n  const autoRenewal = extracted.auto_renewal;\n\n  if (typeof autoRenewal !== 'boolean') {\n    errors.push('auto_renewal must be true or false');\n  }\n\n  // ---------- ANNUAL VALUE ----------\n  const valueRaw = extracted.annual_value;\n\n  let annualValue = NaN;\n\n  if (typeof valueRaw === 'number') {\n    annualValue = valueRaw;\n  } else if (typeof valueRaw === 'string' && valueRaw.trim() !== '') {\n    annualValue = Number(valueRaw.replace(/[$,]/g, ''));\n  }\n\n  if (!Number.isFinite(annualValue) || annualValue < 0) {\n    errors.push('annual_value must be a non-negative number');\n  }\n\n  // ---------- RESULT ----------\n  if (errors.length > 0) {\n    results.push({\n      json: {\n        valid: false,\n        errors\n      }\n    });\n  } else {\n    results.push({\n      json: {\n        valid: true,\n        vendor,\n        renewal_date: renewalDate,\n        notice_period_days: noticePeriod,\n        auto_renewal: autoRenewal,\n        annual_value: annualValue\n      }\n    });\n  }\n}\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        32,
+        -80
+      ],
+      "id": "f6e798ac-bea6-472b-ba77-a3aaaf008ed3",
+      "name": "Validate & Normalize Contract Terms"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const data = item.json;\n\n  const errors = [];\n\n  const renewalDate = data.renewal_date;\n  const noticePeriod = Number(data.notice_period_days);\n\n  // ---------- Validate calculation inputs ----------\n  if (!renewalDate || !/^\\d{4}-\\d{2}-\\d{2}$/.test(renewalDate)) {\n    errors.push('renewal_date must be in YYYY-MM-DD format');\n  }\n\n  if (!Number.isFinite(noticePeriod) || noticePeriod < 0) {\n    errors.push('notice_period_days must be a non-negative number');\n  }\n\n  if (errors.length > 0) {\n    results.push({\n      json: {\n        valid: false,\n        calculation_status: 'FAILED',\n        errors\n      }\n    });\n    continue;\n  }\n\n  // ---------- Convert ISO date → UTC day (timezone-safe) ----------\n  function isoToUtcDay(isoDate) {\n    const [year, month, day] = isoDate.split('-').map(Number);\n    return Date.UTC(year, month - 1, day);\n  }\n\n  // ---------- Calculate notice deadline ----------\n  const millisecondsPerDay = 24 * 60 * 60 * 1000;\n  const renewalTimestamp = isoToUtcDay(renewalDate);\n  const deadlineTimestamp = renewalTimestamp - (noticePeriod * millisecondsPerDay);\n\n  const noticeDeadline = new Date(deadlineTimestamp)\n    .toISOString()\n    .slice(0, 10);\n\n  // ---------- Today (calendar date, UTC) ----------\n  const now = new Date();\n  const todayUtc = Date.UTC(\n    now.getUTCFullYear(),\n    now.getUTCMonth(),\n    now.getUTCDate()\n  );\n\n  // ---------- Days remaining ----------\n  const daysUntilDeadline = Math.round(\n    (deadlineTimestamp - todayUtc) / millisecondsPerDay\n  );\n\n  results.push({\n    json: {\n      valid: true,\n      calculation_status: 'SUCCESS',\n\n      vendor: data.vendor,\n      renewal_date: renewalDate,\n      notice_period_days: noticePeriod,\n      notice_deadline: noticeDeadline,\n      days_until_deadline: daysUntilDeadline,\n\n      auto_renewal: data.auto_renewal,\n      annual_value: Number(data.annual_value)\n    }\n  });\n}\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        256,
+        -80
+      ],
+      "id": "20941b1d-d1fa-488c-bb59-b59b0c4625a2",
+      "name": "Calculate Renewal Metrics"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst results = [];\nconst contractId = $('Validate Contract Input').first().json.contract_id;\nfor (const item of items) {\n  const data = item.json;\n\n  const errors = [];\n\n  const daysUntilDeadline = Number(data.days_until_deadline);\n  const annualValue = Number(data.annual_value);\n  const autoRenewal = data.auto_renewal;\n\n  if (!Number.isFinite(daysUntilDeadline)) {\n    errors.push('days_until_deadline is invalid');\n  }\n\n  if (!Number.isFinite(annualValue) || annualValue < 0) {\n    errors.push('annual_value is invalid');\n  }\n\n  if (typeof autoRenewal !== 'boolean') {\n    errors.push('auto_renewal must be true or false');\n  }\n\n  if (errors.length > 0) {\n    results.push({\n      json: {\n        valid: false,\n        risk_status: 'MANUAL_REVIEW',\n        errors\n      }\n    });\n    continue;\n  }\n\n  let riskStatus;\n  let riskReason;\n\n  // Rule 1 — URGENT\n  if (\n    autoRenewal === true &&\n    daysUntilDeadline <= 30 &&\n    annualValue >= 10000\n  ) {\n    riskStatus = 'URGENT_REVIEW';\n    riskReason =\n      'Auto-renewing contract has a notice deadline within 30 days and annual value is at least $10,000.';\n  }\n  // Rule 2 — MONITOR\n  else if (\n    autoRenewal === true &&\n    daysUntilDeadline <= 90\n  ) {\n    riskStatus = 'MONITOR';\n    riskReason =\n      'Auto-renewing contract has a notice deadline within 90 days.';\n  }\n  // Rule 3 — NO_ACTION\n  else {\n    riskStatus = 'NO_ACTION';\n    riskReason =\n      'Contract does not currently meet the escalation or monitoring thresholds.';\n  }\n\n  results.push({\n    json: {\n      valid: true,\n      contract_id: contractId,\n      vendor: data.vendor,\n      renewal_date: data.renewal_date,\n      notice_period_days: data.notice_period_days,\n      notice_deadline: data.notice_deadline,\n      days_until_deadline: daysUntilDeadline,\n\n      auto_renewal: autoRenewal,\n      annual_value: annualValue,\n\n      risk_status: riskStatus,\n      risk_reason: riskReason\n    }\n  });\n}\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -912,
+        144
+      ],
+      "id": "9b99434b-b181-44d6-8909-0ae5b3d8833c",
+      "name": "Determine Renewal Risk"
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "value": "public",
+          "mode": "list",
+          "cachedResultName": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "contract_risk_records",
+          "mode": "list",
+          "cachedResultName": "contract_risk_records"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "auto_renewal": "={{ $json.auto_renewal }}",
+            "contract_id": "={{ $json.contract_id }}",
+            "vendor": "={{ $json.vendor }}",
+            "renewal_date": "={{ $json.renewal_date }}",
+            "notice_period_days": "={{ $json.notice_period_days }}",
+            "notice_deadline": "={{ $json.notice_deadline }}",
+            "days_until_deadline": "={{ $json.days_until_deadline }}",
+            "annual_value": "={{ $json.annual_value }}",
+            "risk_status": "={{ $json.risk_status }}",
+            "risk_reason": "={{ $json.risk_reason }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "contract_id",
+              "displayName": "contract_id",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "vendor",
+              "displayName": "vendor",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "renewal_date",
+              "displayName": "renewal_date",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "notice_period_days",
+              "displayName": "notice_period_days",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "notice_deadline",
+              "displayName": "notice_deadline",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "days_until_deadline",
+              "displayName": "days_until_deadline",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "auto_renewal",
+              "displayName": "auto_renewal",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "annual_value",
+              "displayName": "annual_value",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "risk_status",
+              "displayName": "risk_status",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "risk_reason",
+              "displayName": "risk_reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "processed_at",
+              "displayName": "processed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true,
+              "removed": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -688,
+        144
+      ],
+      "id": "0f865b7c-f1ab-41bf-9f74-4a65ff98e94b",
+      "name": "Insert rows in a table",
+      "credentials": {
+        "postgres": {
+          "id": "lwjyKuXhtDALoxTY",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "ab882ef5-97d7-44e5-af89-5490f7f54556",
+              "leftValue": "={{ $json.risk_status }}",
+              "rightValue": "URGENT_REVIEW",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -464,
+        144
+      ],
+      "id": "799aadb8-97fe-44dd-aa87-2e66035b6338",
+      "name": "Should Send Slack Alert?"
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "C0BV5V99YH2",
+          "mode": "list",
+          "cachedResultName": "all-urgent-tickets"
+        },
+        "text": "=🚨 Contract Renewal Risk Alert\n\nVendor: {{ $json.vendor }}\nContract: {{ $json.contract_id }}\n\nRenewal Date: {{ $json.renewal_date }}\nNotice Deadline: {{ $json.notice_deadline }}\nDays Remaining: {{ $json.days_until_deadline }}\n\nAnnual Value: ${{ $json.annual_value }}\nAuto-Renewal: {{ $json.auto_renewal }}\n\nRisk: {{ $json.risk_status }}\n\nReason:\n{{ $json.risk_reason }}",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.7,
+      "position": [
+        -224,
+        128
+      ],
+      "id": "8e661ad5-5e53-4b7e-8297-a77ac3140b6b",
+      "name": "Send Renewal Risk Alert",
+      "webhookId": "62f095af-02c3-46c7-b8e5-ccc5137acaa1",
+      "credentials": {
+        "slackOAuth2Api": {
+          "id": "5JjLoMo4QRNqg8Ok",
+          "name": "Slack account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Receive contract": {
+      "main": [
+        [
+          {
+            "node": "Validate Contract Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Contract Input": {
+      "main": [
+        [
+          {
+            "node": "Message a model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Message a model": {
+      "main": [
+        [
+          {
+            "node": "Validate & Normalize Contract Terms",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Normalize Contract Terms": {
+      "main": [
+        [
+          {
+            "node": "Calculate Renewal Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Renewal Metrics": {
+      "main": [
+        [
+          {
+            "node": "Determine Renewal Risk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Determine Renewal Risk": {
+      "main": [
+        [
+          {
+            "node": "Insert rows in a table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert rows in a table": {
+      "main": [
+        [
+          {
+            "node": "Should Send Slack Alert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Send Slack Alert?": {
+      "main": [
+        [
+          {
+            "node": "Send Renewal Risk Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "0245c1db-ee13-408e-8757-0c45ef7584dc",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "ac6f4f0d3cab462720d3c9ba0e60bbbddfed640a666e9dd9e2b23a8e64af04ea"
+  },
+  "nodeGroups": [],
+  "id": "5Sbpq6d0w5Lca9RG",
+  "tags": []
+}
